@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Send, Bot, User } from "lucide-react"
+import { Send, Bot, User, Clock, Zap } from 'lucide-react'
 
 interface Message {
   id: string
@@ -23,6 +23,7 @@ export function ChatInterface({ patientHistory }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
+  const [loadingStatus, setLoadingStatus] = useState<string>("")
   const scrollAreaRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -35,30 +36,62 @@ export function ChatInterface({ patientHistory }: ChatInterfaceProps) {
     e.preventDefault()
     if (!input.trim() || isLoading) return
 
+    console.log("🚀 Chat Interface: Starting new message submission")
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: "user",
       content: input,
     }
 
+    console.log("👤 Chat Interface: User message:", {
+      id: userMessage.id,
+      contentLength: userMessage.content.length,
+      content: userMessage.content
+    })
+
     setMessages((prev) => [...prev, userMessage])
     setInput("")
     setIsLoading(true)
+    setLoadingStatus("Sending request...")
+
+    const requestPayload = {
+      messages: [...messages, userMessage].map((m) => ({ role: m.role, content: m.content })),
+      patientHistory,
+    }
+
+    console.log("📤 Chat Interface: Sending request:", {
+      messagesCount: requestPayload.messages.length,
+      hasPatientHistory: !!requestPayload.patientHistory,
+      payloadSize: JSON.stringify(requestPayload).length
+    })
 
     try {
+      const startTime = Date.now()
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          messages: [...messages, userMessage].map((m) => ({ role: m.role, content: m.content })),
-          patientHistory,
-        }),
+        body: JSON.stringify(requestPayload),
+      })
+
+      const responseTime = Date.now() - startTime
+      console.log("📥 Chat Interface: Response received:", {
+        status: response.status,
+        statusText: response.statusText,
+        responseTime: `${responseTime}ms`,
+        headers: Object.fromEntries(response.headers.entries())
       })
 
       if (!response.ok) {
-        throw new Error("Failed to get response")
+        const errorText = await response.text()
+        console.error("❌ Chat Interface: API error:", {
+          status: response.status,
+          statusText: response.statusText,
+          errorBody: errorText
+        })
+        throw new Error(`API error: ${response.status} - ${errorText}`)
       }
 
       const assistantMessage: Message = {
@@ -67,55 +100,131 @@ export function ChatInterface({ patientHistory }: ChatInterfaceProps) {
         content: "",
       }
 
+      console.log("🤖 Chat Interface: Created assistant message:", assistantMessage.id)
       setMessages((prev) => [...prev, assistantMessage])
 
       const reader = response.body?.getReader()
       const decoder = new TextDecoder()
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
+      if (!reader) {
+        console.error("❌ Chat Interface: No reader available")
+        throw new Error("No response stream available")
+      }
 
-          const chunk = decoder.decode(value)
-          const lines = chunk.split("\n")
+      console.log("🌊 Chat Interface: Starting to read stream")
+      let totalChunks = 0
+      let totalContent = ""
 
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6)
-              if (data === "[DONE]") {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          console.log("✅ Chat Interface: Stream reading completed:", {
+            totalChunks,
+            totalContentLength: totalContent.length
+          })
+          break
+        }
+
+        const chunk = decoder.decode(value)
+        const lines = chunk.split("\n")
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6)
+            if (data === "[DONE]") {
+              console.log("🏁 Chat Interface: Received [DONE] signal")
+              setIsLoading(false)
+              setLoadingStatus("")
+              return
+            }
+
+            try {
+              const parsed = JSON.parse(data)
+              
+              // Handle status updates
+              if (parsed.status) {
+                console.log("📊 Chat Interface: Status update:", parsed.status)
+                switch (parsed.status) {
+                  case "queued":
+                    setLoadingStatus("Request queued, waiting for processing...")
+                    break
+                  case "processing":
+                    setLoadingStatus("Processing your request...")
+                    break
+                  case "streaming":
+                    setLoadingStatus("Generating response...")
+                    break
+                  default:
+                    setLoadingStatus(parsed.message || "Processing...")
+                }
+              }
+              
+              // Handle error messages
+              if (parsed.error) {
+                console.error("❌ Chat Interface: Received error:", parsed.error)
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessage.id 
+                      ? { ...msg, content: `Error: ${parsed.error}${parsed.details ? ` - ${parsed.details}` : ''}` }
+                      : msg
+                  )
+                )
                 setIsLoading(false)
+                setLoadingStatus("")
                 return
               }
-
-              try {
-                const parsed = JSON.parse(data)
-                if (parsed.content) {
-                  setMessages((prev) =>
-                    prev.map((msg) =>
-                      msg.id === assistantMessage.id ? { ...msg, content: msg.content + parsed.content } : msg,
-                    ),
-                  )
+              
+              // Handle content chunks
+              if (parsed.content) {
+                totalChunks++
+                totalContent += parsed.content
+                
+                if (totalChunks % 10 === 0) {
+                  console.log(`🔄 Chat Interface: Processed ${totalChunks} chunks, content length: ${totalContent.length}`)
                 }
-              } catch (e) {
-                // Ignore parsing errors
+
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === assistantMessage.id ? { ...msg, content: msg.content + parsed.content } : msg,
+                  ),
+                )
               }
+            } catch (parseError) {
+              console.warn("⚠️ Chat Interface: Failed to parse chunk:", {
+                data,
+                error: parseError.message
+              })
             }
           }
         }
       }
     } catch (error) {
-      console.error("Chat error:", error)
+      console.error("💥 Chat Interface: Error during chat:", {
+        message: error.message,
+        stack: error.stack
+      })
+      
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           role: "assistant",
-          content: "Sorry, I encountered an error. Please try again.",
+          content: `Sorry, I encountered an error: ${error.message}. Please check the console for more details and try again.`,
         },
       ])
     } finally {
       setIsLoading(false)
+      setLoadingStatus("")
+    }
+  }
+
+  const getLoadingIcon = () => {
+    if (loadingStatus.includes("queued") || loadingStatus.includes("waiting")) {
+      return <Clock className="w-5 h-5 text-yellow-500" />
+    } else if (loadingStatus.includes("processing")) {
+      return <Zap className="w-5 h-5 text-blue-500" />
+    } else {
+      return <Bot className="w-5 h-5 text-green-500" />
     }
   }
 
@@ -161,17 +270,24 @@ export function ChatInterface({ patientHistory }: ChatInterfaceProps) {
             <div className="flex justify-start mb-6">
               <div className="bg-gray-700 border border-gray-600 rounded-2xl p-4">
                 <div className="flex items-center gap-3">
-                  <Bot className="w-5 h-5 text-green-500" />
-                  <div className="flex space-x-2">
-                    <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce"></div>
-                    <div
-                      className="w-2 h-2 bg-green-500 rounded-full animate-bounce"
-                      style={{ animationDelay: "0.1s" }}
-                    ></div>
-                    <div
-                      className="w-2 h-2 bg-green-500 rounded-full animate-bounce"
-                      style={{ animationDelay: "0.2s" }}
-                    ></div>
+                  {getLoadingIcon()}
+                  <div className="flex flex-col">
+                    <div className="flex space-x-2 mb-1">
+                      <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce"></div>
+                      <div
+                        className="w-2 h-2 bg-green-500 rounded-full animate-bounce"
+                        style={{ animationDelay: "0.1s" }}
+                      ></div>
+                      <div
+                        className="w-2 h-2 bg-green-500 rounded-full animate-bounce"
+                        style={{ animationDelay: "0.2s" }}
+                      ></div>
+                    </div>
+                    {loadingStatus && (
+                      <div className="text-xs text-gray-400 mt-1">
+                        {loadingStatus}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
